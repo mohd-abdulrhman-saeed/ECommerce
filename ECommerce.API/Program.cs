@@ -1,28 +1,39 @@
-﻿using ECommerce.Core.Interfaces;
+﻿using ECommerce.API.Services;
+using ECommerce.Core.Interfaces;
 using ECommerce.Infrastructure.Caching;
+using Microsoft.OpenApi.Models;
+using OpenTelemetry.Metrics;
 using Polly;
 using Polly.CircuitBreaker;
 using Polly.Timeout;
+using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// تأكد من ضبط الـ SwaggerGen مع تحديد الإصدار صراحة لتجنب مشكلة الـ Version field
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    c.SwaggerDoc("v1", new Microsoft.OpenApi.Models.OpenApiInfo
-    {
-        Title = "ECommerce.API",
-        Version = "v1"
-    });
+    c.SwaggerDoc("v1", new OpenApiInfo { Title = "ECommerce API", Version = "v1" });
 });
 
-// 1. إضافة StackExchange Redis Distributed Cache
+// Redis Multiplexer
+builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
+    ConnectionMultiplexer.Connect(builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379"));
+
 builder.Services.AddStackExchangeRedisCache(options =>
 {
     options.Configuration = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
 });
 
-// 2. إعداد Polly Pipeline (Timeout: 100ms + Circuit Breaker)
+//builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
+//    ConnectionMultiplexer.Connect("127.0.0.1:6379,abortConnect=false,connectTimeout=10000,syncTimeout=10000"));
+
+//builder.Services.AddStackExchangeRedisCache(options =>
+//{
+//    options.Configuration = "127.0.0.1:6379,abortConnect=false,connectTimeout=10000,syncTimeout=10000";
+//});
+// Polly Pipeline
 builder.Services.AddSingleton<ResiliencePipeline<byte[]>>(sp =>
 {
     return new ResiliencePipelineBuilder<byte[]>()
@@ -39,34 +50,32 @@ builder.Services.AddSingleton<ResiliencePipeline<byte[]>>(sp =>
 });
 
 
-// 3. حقن التبعيات
-builder.Services.AddSingleton<SingleFlightService>();
+// Services & Distributed Locks & Cache Warming
+builder.Services.AddSingleton<DistributedLockService>();
 builder.Services.AddScoped<ICachingService, RedisCachingService>();
+builder.Services.AddHostedService<CacheWarmingService>();
 
-builder.Services.AddControllers();
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+// OpenTelemetry Metrics
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(metrics => metrics
+        .AddAspNetCoreInstrumentation()
+        .AddMeter("ECommerce.Caching")
+        .AddPrometheusExporter());
 
 var app = builder.Build();
 
-//app.UseSwagger();
-//app.UseSwaggerUI();
-//app.UseSwagger();
-//app.UseSwaggerUI(c =>
-//{
-//    c.SwaggerEndpoint("/swagger/v1/swagger.json", "ECommerce.API v1");
-//});
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
+app.UseSwagger();
+app.UseSwaggerUI(c =>
 {
-    app.UseSwagger();
-    app.UseSwaggerUI(c =>
-    {
-        c.SwaggerEndpoint("/swagger/v1/swagger.json", "ECommerce.API v1");
-        //c.RoutePrefix = string.Empty; // يجعل الـ Swagger يفتح مباشرة عند تشغيل المشروع على الـ Root URL
-    });
-}
+    c.SwaggerEndpoint("/swagger/v1/swagger.json", "ECommerce API v1");
+    c.RoutePrefix = string.Empty;
+});
 
+// تفعيل نقطة نهاية Prometheus للـ Metrics
+app.MapPrometheusScrapingEndpoint();
+
+app.UseHttpsRedirection();
+app.UseAuthorization();
 app.MapControllers();
 
 app.Run();

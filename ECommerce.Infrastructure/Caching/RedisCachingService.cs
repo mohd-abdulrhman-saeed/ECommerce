@@ -1,5 +1,5 @@
-﻿using System.Text.Json;
-using ECommerce.Core.Interfaces;
+﻿using ECommerce.Core.Interfaces;
+using MessagePack;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Logging;
 using Polly;
@@ -9,18 +9,18 @@ namespace ECommerce.Infrastructure.Caching;
 public class RedisCachingService : ICachingService
 {
     private readonly IDistributedCache _distributedCache;
-    private readonly SingleFlightService _singleFlight;
+    private readonly DistributedLockService _distributedLock;
     private readonly ResiliencePipeline<byte[]> _resiliencePipeline;
     private readonly ILogger<RedisCachingService> _logger;
 
     public RedisCachingService(
         IDistributedCache distributedCache,
-        SingleFlightService singleFlight,
+        DistributedLockService distributedLock,
         ResiliencePipeline<byte[]> resiliencePipeline,
         ILogger<RedisCachingService> logger)
     {
         _distributedCache = distributedCache;
-        _singleFlight = singleFlight;
+        _distributedLock = distributedLock;
         _resiliencePipeline = resiliencePipeline;
         _logger = logger;
     }
@@ -31,39 +31,26 @@ public class RedisCachingService : ICachingService
         TimeSpan? ttl = null,
         CancellationToken cancellationToken = default)
     {
-        //byte[]? cachedBytes = null;
-        //try
-        //{
-        //    // 1. قراءة من الكاش مع Timeout + Circuit Breaker (Polly)
-        //    cachedBytes = await _resiliencePipeline.ExecuteAsync(
-        //        async token => await _distributedCache.GetAsync(cacheKey, token),
-        //        cancellationToken);
-        //}
-        //catch (Exception ex)
-        //{
-        //    _logger.LogWarning(ex, "Redis cache is unavailable or timed out. Falling back to Database.");
-        //}
         byte[]? cachedBytes = null;
         try
         {
-            // إخبار الـ Pipeline أن النتيجة قد تكون byte[]? من خلال تحديد النوع صراحةً
             cachedBytes = await _resiliencePipeline.ExecuteAsync<byte[]?>(
                 async token => await _distributedCache.GetAsync(cacheKey, token),
                 cancellationToken);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Redis cache is unavailable or timed out. Falling back to Database.");
+            _logger.LogWarning(ex, "Redis cache unavailable. Falling back to DB.");
         }
-
 
         if (cachedBytes is not null)
         {
-            return JsonSerializer.Deserialize<T>(cachedBytes);
+            // فك الـ Serialization السريع باستخدام MessagePack
+            return MessagePackSerializer.Deserialize<T>(cachedBytes, cancellationToken: cancellationToken);
         }
 
-        // 2. استخدام Single Flight لمنع الـ Stampede Problem
-        return await _singleFlight.ExecuteAsync(cacheKey, async () =>
+        // استخدام Distributed Lock لمنع الـ Stampede عبر عدة سيرفرات
+        return await _distributedLock.ExecuteWithLockAsync(cacheKey, TimeSpan.FromSeconds(10), async () =>
         {
             var dbData = await factory(cancellationToken);
 
@@ -74,19 +61,13 @@ public class RedisCachingService : ICachingService
                     AbsoluteExpirationRelativeToNow = ttl ?? TimeSpan.FromMinutes(5)
                 };
 
-                var serializedData = JsonSerializer.SerializeToUtf8Bytes(dbData);
+                // تحويل البيانات لـ bytes باستخدام MessagePack
+                var serializedData = MessagePackSerializer.Serialize(dbData, cancellationToken: cancellationToken);
 
-                // حفظ غير متزامن لا يعطل الطلب لو حصلت مشكلة طارئة في Redis
                 _ = Task.Run(async () =>
                 {
-                    try
-                    {
-                        await _distributedCache.SetAsync(cacheKey, serializedData, options);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to write back to cache for key: {Key}", cacheKey);
-                    }
+                    try { await _distributedCache.SetAsync(cacheKey, serializedData, options); }
+                    catch { /* Log */ }
                 });
             }
 
@@ -96,7 +77,6 @@ public class RedisCachingService : ICachingService
 
     public async Task RemoveAsync(string cacheKey, CancellationToken cancellationToken = default)
     {
-        // Command-Based Invalidation
         try
         {
             await _distributedCache.RemoveAsync(cacheKey, cancellationToken);
